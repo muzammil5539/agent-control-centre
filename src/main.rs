@@ -6,6 +6,7 @@
     windows_subsystem = "windows"
 )]
 
+mod shell;
 mod theme;
 
 use agent_control_centre::procs::{self, CAN_PAUSE, Procs, Sig};
@@ -16,6 +17,7 @@ use eframe::egui::{self, Color32, Margin, RichText, Stroke};
 use serde_json::json;
 use std::{
     io::Read,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -480,10 +482,13 @@ enum Tab {
 
 struct App {
     store: Arc<Mutex<Store>>,
-    procs: Procs,
+    procs: Arc<Mutex<Procs>>,
+    pinned: Arc<AtomicBool>,
+    visible: Arc<AtomicBool>,
+    quitting: Arc<AtomicBool>,
+    shell: shell::Shell,
     tab: Tab,
     filter: String, // activity feed: agent id, empty = all
-    pinned: bool,
     name: String,
     cmd: String,
     dir: String,
@@ -538,20 +543,16 @@ impl App {
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (label, kind) = if self.pinned {
+                let pinned = self.pinned.load(Ordering::SeqCst);
+                let (label, kind) = if pinned {
                     ("Pinned on top", Kind::Primary)
                 } else {
                     ("Pin on top", Kind::Ghost)
                 };
                 if button(ui, label, kind).clicked() {
-                    self.pinned = !self.pinned;
-                    let lvl = if self.pinned {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::WindowLevel::Normal
-                    };
+                    self.pinned.store(!pinned, Ordering::SeqCst);
                     ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(lvl));
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level(!pinned)));
                 }
             });
         });
@@ -742,10 +743,13 @@ impl App {
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if button(ui, "Start agent", Kind::Primary).clicked() || enter {
             let ctx = ui.ctx().clone();
-            match self
-                .procs
-                .spawn(&self.store, &ctx, &self.name, &self.cmd, &self.dir)
-            {
+            match self.procs.lock().unwrap().spawn(
+                &self.store,
+                &ctx,
+                &self.name,
+                &self.cmd,
+                &self.dir,
+            ) {
                 Ok(()) => {
                     self.err = None;
                     self.name.clear();
@@ -764,6 +768,31 @@ impl App {
             ui,
             "acc emit agent.progress $ACC_AGENT_ID --progress 40 --task \"Indexing\"",
         );
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new("DESKTOP INTEGRATION")
+                .size(10.5)
+                .font(theme::semibold(10.5))
+                .color(DIM),
+        );
+        match &self.shell.tray {
+            Ok(()) => ui.label(RichText::new("Tray: active. Closing the window hides it to the tray; use the tray menu to quit.").size(12.0).color(DIM)),
+            Err(e) => ui.label(RichText::new(format!("Tray: unavailable ({e}). Closing the window quits.")).size(12.0).color(status_color(Status::Waiting))),
+        };
+        match &self.shell.hotkey {
+            Ok(l) => ui.label(
+                RichText::new(format!(
+                    "Hotkey: {l} shows or hides the window (change with ACC_HOTKEY)."
+                ))
+                .size(12.0)
+                .color(DIM),
+            ),
+            Err(e) => ui.label(
+                RichText::new(format!("Hotkey: {e}"))
+                    .size(12.0)
+                    .color(status_color(Status::Waiting)),
+            ),
+        };
     }
 }
 
@@ -775,13 +804,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_secs(1)); // keep ages and heartbeats fresh
         let store = self.store.clone();
-        let notices: Vec<Notice> = {
-            let mut s = store.lock().unwrap();
-            let mut n = s.sweep(1.0);
-            n.extend(self.procs.reap(&mut s));
-            n
-        };
-        notices.into_iter().for_each(notify);
+        // Closing the window hides it to the tray, but only if a tray really exists (else the user could never get back).
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.shell.tray.is_ok()
+            && !self.quitting.load(Ordering::SeqCst)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.visible.store(false, Ordering::SeqCst);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
 
         let mut acts = vec![];
         egui::Frame::new()
@@ -803,32 +835,19 @@ impl eframe::App for App {
     }
 }
 
-fn icon() -> egui::IconData {
-    // 64x64: green status dot on a dark rounded tile.
-    let n = 64usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    for y in 0..n {
-        for x in 0..n {
-            let (dx, dy) = (x as f32 - 31.5, y as f32 - 31.5);
-            let d = (dx * dx + dy * dy).sqrt();
-            let c = if d < 13.0 {
-                Some([0x22, 0xC5, 0x5E])
-            } else if d < 20.0 {
-                Some([0x1B, 0x4D, 0x36])
-            } else if x > 3 && y > 3 && x < 60 && y < 60 {
-                Some([0x0F, 0x17, 0x2A])
-            } else {
-                None
-            };
-            if let Some([r, g, b]) = c {
-                rgba[(y * n + x) * 4..][..4].copy_from_slice(&[r, g, b, 255]);
-            }
-        }
+fn level(pinned: bool) -> egui::WindowLevel {
+    if pinned {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
     }
+}
+
+fn icon() -> egui::IconData {
     egui::IconData {
-        rgba,
-        width: n as u32,
-        height: n as u32,
+        rgba: shell::dot_rgba(shell::GREEN),
+        width: 64,
+        height: 64,
     }
 }
 
@@ -859,13 +878,78 @@ fn main() -> eframe::Result {
                 let (s, ctx) = (s.clone(), ctx.clone());
                 move || serve(server, s, ctx)
             });
-            procs::watch(s, ctx);
+            procs::watch(s.clone(), ctx.clone());
+
+            let procs = Arc::new(Mutex::new(Procs::default()));
+            let (pinned, visible, quitting) = (
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+            );
+
+            // Background ticker: heartbeat/approval expiry and managed-process exits keep working while the window is hidden in the tray.
+            std::thread::spawn({
+                let (s, procs, ctx) = (s.clone(), procs.clone(), ctx.clone());
+                move || loop {
+                    let notices: Vec<Notice> = {
+                        let mut st = s.lock().unwrap();
+                        let mut n = st.sweep(1.0);
+                        n.extend(procs.lock().unwrap().reap(&mut st));
+                        n
+                    };
+                    notices.into_iter().for_each(notify);
+                    ctx.request_repaint();
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+
+            // Tray + hotkey commands.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let shell = shell::start(tx, s.clone());
+            std::thread::spawn({
+                let (ctx, visible, pinned, quitting) = (
+                    ctx.clone(),
+                    visible.clone(),
+                    pinned.clone(),
+                    quitting.clone(),
+                );
+                move || {
+                    for cmd in rx {
+                        match cmd {
+                            shell::Cmd::Toggle => {
+                                let show = !visible.fetch_xor(true, Ordering::SeqCst);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
+                                if show {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                }
+                            }
+                            shell::Cmd::Pin => {
+                                let p = !pinned.fetch_xor(true, Ordering::SeqCst);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level(p)));
+                            }
+                            shell::Cmd::Quit => {
+                                quitting.store(true, Ordering::SeqCst);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                std::thread::spawn(|| {
+                                    std::thread::sleep(Duration::from_secs(2));
+                                    std::process::exit(0); // a hidden window may not process Close
+                                });
+                            }
+                        }
+                    }
+                }
+            });
             Ok(Box::new(App {
                 store,
-                procs: Procs::default(),
+                procs,
+                pinned,
+                visible,
+                quitting,
+                shell,
                 tab: Tab::Agents,
                 filter: String::new(),
-                pinned: true,
                 name: String::new(),
                 cmd: String::new(),
                 dir: String::new(),

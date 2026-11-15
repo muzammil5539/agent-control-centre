@@ -23,12 +23,15 @@ driving the real app). The Windows build is cross-compiled and not hand-tested.
 - Event API: `agent.started/progress/waiting/completed/failed/heartbeat`, `approval.required`; heartbeat-lost detection with per-agent `ttl`; paused state sticks until resumed.
 - Launch managed agents with streamed output; Pause / Resume / Stop (Linux: process-group signals; Windows: Stop only).
 - Auto-detect running agent CLIs with CPU/memory.
+- **System tray** (Linux: StatusNotifierItem via `ksni`, no GTK; Windows: `tray-icon`), **minimise-to-tray** (close hides, only when a tray really exists), **global show/hide hotkey** (default Ctrl+Alt+A, `ACC_HOTKEY`), tray menu Show/Hide / Pin / Quit, tray "needs attention" state with tooltip on Linux. Background work (heartbeat/approval expiry, managed-process exit) runs on its own thread so it continues while the window is hidden.
 
-Tests: `cargo test` (10): state machine, approvals, history, heartbeat, launch/pause/resume/stop of a real child, process detection, hook mapping, gate rules.
+Tests: `cargo test` (12): state machine, approvals, history, heartbeat, launch/pause/resume/stop of a real child, process detection, hook mapping, gate rules, hotkey parsing.
+
+Tray/hotkey were verified on Linux (X11 + a real Cinnamon StatusNotifier watcher): hotkey toggle, tray click, close-to-tray, menu Show/Hide and Quit, attention state. **Windows tray/hotkey compile but have not been run.** Wayland has no global hotkey support in the crate.
 
 ## Backlog (not implemented, no UI pretends otherwise)
 
-- System tray and minimise-to-tray; global show/hide hotkey (tray-icon needs GTK dev packages on Linux).
+- macOS tray/hotkey; Windows tray icon/tooltip reflecting pending approvals; start-hidden option.
 - WebSocket stream, API auth token, rate limiting, versioned `/api/v1`, `event_id`/`sequence` dedup.
 - SQLite, retention policies, export, notification history/preferences, snooze.
 - Workspaces, filesystem watcher, git status, cross-agent conflict detection.

@@ -21,6 +21,10 @@ Runs on **Linux** and **Windows**.
 - **Activity history for every agent**, persisted across restarts: each agent card has an expandable
   History (tool calls, approvals asked / granted / denied / expired), plus a filterable Activity feed.
 - **Live agent board**: status, task, progress, heartbeat age. Anything needing you floats to the top.
+- **System tray + global hotkey.** The HUD lives in your tray: closing the window hides it (agents,
+  notifications and approvals keep working), **Ctrl+Alt+A** shows/hides it from anywhere (change with
+  `ACC_HOTKEY`, e.g. `ACC_HOTKEY=ctrl+shift+Space`), the tray menu has Show/Hide, Pin on top and Quit,
+  and on Linux the tray icon turns amber with a tooltip while approvals are waiting.
 - **Native notifications** for approval-needed, finished, failed and lost agents.
 - **Launch agents** from the *Launch* tab (any shell command). Output streams into the card;
   the child can report progress via `acc emit ... $ACC_AGENT_ID` or gate actions with `acc ask`.
@@ -86,8 +90,12 @@ Read back: `GET /agents`, `GET /agents/<id>`, `GET /approvals` (pending) and
 
 - Anything on localhost can post events, so the port is bound to `127.0.0.1` only; don't expose it.
   The API reports state; it never starts processes. Only you can, from the Launch tab.
+- Tray: Linux needs a StatusNotifier host (KDE, Cinnamon, XFCE and others have one; GNOME needs the AppIndicator
+  extension). If there is no tray, closing the window quits instead of hiding, and the Launch tab says so.
+- Global hotkey: X11 and Windows only. On Wayland it is reported as unavailable (use the tray).
+  Windows tray tooltip/icon do not change for pending approvals yet.
 - Detection is name-based and can miss or mislabel unusual setups.
-- Not yet: system tray, global hotkey, token/cost tracking, remote machines. Full list: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+- Not yet: token/cost tracking, remote machines. Full list: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
 - The local API has no auth token yet: another local process could post a fake approval *request* (it still can't answer one).
 - The Windows build is cross-compiled; it has had less hands-on testing than Linux.
 
