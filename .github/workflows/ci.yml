@@ -1,6 +1,6 @@
 name: CI
 on:
-  push: { branches: [main], tags: ["v*"] }
+  push: { branches: [main] }
   pull_request:
 jobs:
   build:
@@ -18,4 +18,6 @@ jobs:
           name: agent-control-centre-${{ matrix.os }}
           path: |
             target/release/agent-control-centre
+            target/release/acc
             target/release/agent-control-centre.exe
+            target/release/acc.exe

@@ -2,10 +2,17 @@
 name = "agent-control-centre"
 version = "0.1.0"
 edition = "2024"
+description = "Always-on-top native HUD to monitor, approve and control AI agents on your machine"
+license = "MIT"
 
 [dependencies]
 eframe = "0.37.0"
 notify-rust = "4.19.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sysinfo = "0.40.3"
 tiny_http = "0.12.0"
+
+[profile.release]
+strip = true
+lto = "thin"
