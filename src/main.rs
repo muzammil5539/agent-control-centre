@@ -10,7 +10,7 @@ mod theme;
 
 use agent_control_centre::procs::{self, CAN_PAUSE, Procs, Sig};
 use agent_control_centre::store::{
-    ADDR, Agent, Detected, Event, Notice, Source, Status, Store, now_secs,
+    ADDR, Agent, Approval, Detected, Entry, Event, Notice, Source, Status, Store, now_secs,
 };
 use eframe::egui::{self, Color32, Margin, RichText, Stroke};
 use serde_json::json;
@@ -46,6 +46,9 @@ fn serve(server: tiny_http::Server, store: Arc<Mutex<Store>>, ctx: egui::Context
     for mut req in server.incoming_requests() {
         let method = req.method().clone();
         let path = req.url().to_string();
+        // Expire stale approvals/heartbeats on every request too, so answers stay correct while the window is hidden.
+        let swept = store.lock().unwrap().sweep(1.0);
+        swept.into_iter().for_each(notify);
         let (code, body) = match (method, path.as_str()) {
             (tiny_http::Method::Post, "/event") => {
                 let mut buf = String::new();
@@ -73,6 +76,26 @@ fn serve(server: tiny_http::Server, store: Arc<Mutex<Store>>, ctx: egui::Context
                     .map(|(id, a)| json!({"agent_id": id, "status": a.status.api(), "task": a.task, "progress": a.progress, "approval": a.approval}))
                     .collect();
                 (200, json!(list))
+            }
+            (tiny_http::Method::Get, "/approvals") => {
+                let s = store.lock().unwrap();
+                let list: Vec<_> = s
+                    .pending_approvals()
+                    .map(|a| json!({"approval_id": a.id, "agent_id": a.agent_id, "detail": a.detail, "expires_in": a.remaining().as_secs()}))
+                    .collect();
+                (200, json!(list))
+            }
+            (tiny_http::Method::Get, p) if p.starts_with("/approvals/") => {
+                match store
+                    .lock()
+                    .unwrap()
+                    .approvals
+                    .iter()
+                    .find(|a| a.id == p["/approvals/".len()..])
+                {
+                    Some(a) => (200, json!({"status": a.status()})),
+                    None => (404, json!({"error": "unknown approval"})),
+                }
             }
             (tiny_http::Method::Get, p) if p.starts_with("/agents/") => {
                 match store.lock().unwrap().agents.get(&p["/agents/".len()..]) {
@@ -228,7 +251,7 @@ fn controls(
     });
 }
 
-fn agent_card(ui: &mut egui::Ui, acts: &mut Vec<Act>, id: &str, a: &Agent) {
+fn agent_card(ui: &mut egui::Ui, acts: &mut Vec<Act>, s: &Store, id: &str, a: &Agent) {
     let col = status_color(a.status);
     card(ui, col, |ui| {
         ui.horizontal(|ui| {
@@ -287,13 +310,23 @@ fn agent_card(ui: &mut egui::Ui, acts: &mut Vec<Act>, id: &str, a: &Agent) {
             meta += &format!(" · pid {pid}");
         }
         dim_mono(ui, meta);
-        if a.status == Status::Approval {
-            ui.horizontal(|ui| {
-                if button(ui, "Approve", Kind::Primary).clicked() {
-                    acts.push(Act::Answer(id.into(), true));
-                }
-                if button(ui, "Deny", Kind::Danger).clicked() {
-                    acts.push(Act::Answer(id.into(), false));
+        let hist: Vec<&Entry> = s
+            .history
+            .iter()
+            .rev()
+            .filter(|e| e.agent_id == id)
+            .collect();
+        if !hist.is_empty() {
+            let now = now_secs();
+            egui::CollapsingHeader::new(
+                RichText::new(format!("History ({})", hist.len()))
+                    .size(12.0)
+                    .color(DIM),
+            )
+            .id_salt(("hist", id))
+            .show(ui, |ui| {
+                for e in hist.iter().take(40) {
+                    entry_row(ui, e, now, false);
                 }
             });
         }
@@ -308,6 +341,98 @@ fn agent_card(ui: &mut egui::Ui, acts: &mut Vec<Act>, id: &str, a: &Agent) {
                 matches!(a.status, Status::Done | Status::Failed),
             );
         }
+    });
+}
+
+fn entry_color(event: &str) -> Color32 {
+    if event.contains("fail") || event.contains("denied") {
+        status_color(Status::Failed)
+    } else if event.contains("lost") || event.contains("expired") {
+        status_color(Status::Lost)
+    } else if event.contains("approval.required") {
+        status_color(Status::Approval)
+    } else if event.contains("completed") || event.contains("exited") {
+        status_color(Status::Done)
+    } else {
+        ACCENT
+    }
+}
+
+/// One line of activity history; `with_agent` adds the agent name (global feed).
+fn entry_row(ui: &mut egui::Ui, e: &Entry, now: u64, with_agent: bool) {
+    let col = entry_color(&e.event);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("●").size(9.0).color(col));
+        if with_agent {
+            ui.label(RichText::new(&e.agent).font(theme::semibold(13.0)));
+        }
+        ui.label(
+            RichText::new(e.event.replace("agent.", ""))
+                .monospace()
+                .size(11.0)
+                .color(col),
+        );
+        ui.label(
+            RichText::new(ago(now.saturating_sub(e.ts)))
+                .monospace()
+                .size(11.0)
+                .color(DIM),
+        );
+    });
+    if !e.message.is_empty() {
+        ui.add(egui::Label::new(RichText::new(&e.message).size(12.0).color(DIM)).truncate());
+    }
+    ui.add_space(2.0);
+}
+
+fn remaining(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn approval_card(ui: &mut egui::Ui, acts: &mut Vec<Act>, ap: &Approval) {
+    let col = status_color(Status::Approval);
+    card(ui, col, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&ap.agent).font(theme::semibold(14.5)));
+            ui.label(RichText::new("is asking").size(11.5).color(DIM));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                pill(
+                    ui,
+                    &format!("expires {}", remaining(ap.remaining().as_secs())),
+                    col,
+                )
+            });
+        });
+        if !ap.message.is_empty() {
+            ui.label(RichText::new(&ap.message).color(DIM).size(12.0));
+        }
+        if !ap.detail.is_empty() {
+            egui::Frame::new()
+                .fill(WELL)
+                .corner_radius(8)
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&ap.detail).monospace().size(12.0).color(FG),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+        ui.horizontal(|ui| {
+            if button(ui, "Approve", Kind::Primary).clicked() {
+                acts.push(Act::Answer(ap.id.clone(), true));
+            }
+            if button(ui, "Deny", Kind::Danger).clicked() {
+                acts.push(Act::Answer(ap.id.clone(), false));
+            }
+        });
     });
 }
 
@@ -357,6 +482,7 @@ struct App {
     store: Arc<Mutex<Store>>,
     procs: Procs,
     tab: Tab,
+    filter: String, // activity feed: agent id, empty = all
     pinned: bool,
     name: String,
     cmd: String,
@@ -504,6 +630,19 @@ impl App {
     }
 
     fn agents_tab(&self, ui: &mut egui::Ui, s: &Store, acts: &mut Vec<Act>) {
+        let pending: Vec<&Approval> = s.pending_approvals().collect();
+        if !pending.is_empty() {
+            ui.label(
+                RichText::new("NEEDS YOUR APPROVAL")
+                    .size(10.5)
+                    .font(theme::semibold(10.5))
+                    .color(status_color(Status::Approval)),
+            );
+            for ap in pending {
+                approval_card(ui, acts, ap);
+            }
+            ui.add_space(4.0);
+        }
         if s.agents.is_empty() && s.detected.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
@@ -515,7 +654,7 @@ impl App {
         let mut list: Vec<_> = s.agents.iter().collect();
         list.sort_by_key(|(_, a)| rank(a.status));
         for (id, a) in list {
-            agent_card(ui, acts, id, a);
+            agent_card(ui, acts, s, id, a);
         }
         if !s.detected.is_empty() {
             ui.add_space(4.0);
@@ -538,48 +677,38 @@ impl App {
         }
     }
 
-    fn activity_tab(&self, ui: &mut egui::Ui, s: &Store) {
-        if s.history.is_empty() {
+    fn activity_tab(&mut self, ui: &mut egui::Ui, s: &Store) {
+        let selected = s
+            .agents
+            .get(&self.filter)
+            .map_or("All agents".to_string(), |a| a.name.clone());
+        egui::ComboBox::from_id_salt("agent_filter")
+            .selected_text(selected)
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.filter, String::new(), "All agents");
+                for (id, a) in &s.agents {
+                    ui.selectable_value(&mut self.filter, id.clone(), &a.name);
+                }
+            });
+        ui.add_space(4.0);
+        let now = now_secs();
+        let mut shown = 0;
+        for e in s
+            .history
+            .iter()
+            .rev()
+            .filter(|e| self.filter.is_empty() || e.agent_id == self.filter)
+            .take(200)
+        {
+            entry_row(ui, e, now, true);
+            shown += 1;
+        }
+        if shown == 0 {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("Nothing has happened yet").color(DIM))
             });
-        }
-        let now = now_secs();
-        for e in s.history.iter().rev().take(150) {
-            let col = if e.event.contains("fail") || e.event.contains("denied") {
-                status_color(Status::Failed)
-            } else if e.event.contains("lost") {
-                status_color(Status::Lost)
-            } else if e.event.contains("approval.required") {
-                status_color(Status::Approval)
-            } else if e.event.contains("completed") || e.event.contains("exited") {
-                status_color(Status::Done)
-            } else {
-                ACCENT
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("●").size(9.0).color(col));
-                ui.label(RichText::new(&e.agent).font(theme::semibold(13.0)));
-                ui.label(
-                    RichText::new(e.event.replace("agent.", ""))
-                        .monospace()
-                        .size(11.0)
-                        .color(col),
-                );
-                ui.label(
-                    RichText::new(ago(now.saturating_sub(e.ts)))
-                        .monospace()
-                        .size(11.0)
-                        .color(DIM),
-                );
-            });
-            if !e.message.is_empty() {
-                ui.add(
-                    egui::Label::new(RichText::new(&e.message).size(12.0).color(DIM)).truncate(),
-                );
-            }
-            ui.add_space(4.0);
         }
     }
 
@@ -710,6 +839,7 @@ fn main() -> eframe::Result {
     });
     let store = Arc::new(Mutex::new(Store::persistent()));
     let opts = eframe::NativeOptions {
+        persist_window: true, // remembers size and position between runs
         viewport: egui::ViewportBuilder::default()
             .with_title("Agent Control Centre")
             .with_inner_size([430.0, 680.0])
@@ -734,6 +864,7 @@ fn main() -> eframe::Result {
                 store,
                 procs: Procs::default(),
                 tab: Tab::Agents,
+                filter: String::new(),
                 pinned: true,
                 name: String::new(),
                 cmd: String::new(),

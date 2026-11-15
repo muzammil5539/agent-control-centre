@@ -102,7 +102,7 @@ impl Procs {
         {
             let mut s = store.lock().unwrap();
             s.agents.insert(id.clone(), a);
-            s.record(name, "agent.started", cmd);
+            s.record(&id, name, "agent.started", cmd);
         }
         let pipes: [Option<Box<dyn std::io::Read + Send>>; 2] = [
             child.stdout.take().map(|p| Box::new(p) as _),
@@ -148,7 +148,7 @@ impl Procs {
                     ));
                 }
                 let (n, m) = (a.name.clone(), a.message.clone());
-                store.record(&n, "agent.exited", &m);
+                store.record(id, &n, "agent.exited", &m);
             }
             false
         });

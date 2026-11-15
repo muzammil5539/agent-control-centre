@@ -9,7 +9,8 @@ use std::{
 
 pub const ADDR: &str = "127.0.0.1:7777"; // localhost only
 pub const DEFAULT_TTL: u32 = 30; // seconds of silence before an API agent is "lost"
-const HISTORY_CAP: usize = 300;
+const HISTORY_CAP: usize = 2000;
+pub const APPROVAL_TTL: u32 = 300; // seconds a pending approval stays open
 const LOG_CAP: usize = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -102,11 +103,47 @@ pub struct Event {
     pub progress: Option<u32>,
     pub pid: Option<u32>,
     pub ttl: Option<u32>,
+    pub approval_id: Option<String>, // unique per request; the agent polls /approvals/<id>
+    pub detail: Option<String>,      // the exact action awaiting approval (shown in full)
+    pub expires_in: Option<u32>,     // approval lifetime in seconds
+    pub notify: Option<bool>,        // force a native notification for this event
+}
+
+/// A request for the user's permission. Bound to one exact action; never auto-approved.
+pub struct Approval {
+    pub id: String,
+    pub agent_id: String,
+    pub agent: String,
+    pub message: String,
+    pub detail: String,
+    pub created: Instant,
+    pub ttl: Duration,
+    pub answer: Option<bool>,
+    pub expired: bool,
+}
+
+impl Approval {
+    pub fn pending(&self) -> bool {
+        self.answer.is_none() && !self.expired
+    }
+    pub fn status(&self) -> &'static str {
+        match (self.answer, self.expired) {
+            (Some(true), _) => "approved",
+            (Some(false), _) => "denied",
+            (None, true) => "expired",
+            _ => "pending",
+        }
+    }
+    pub fn remaining(&self) -> Duration {
+        self.ttl.saturating_sub(self.created.elapsed())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Entry {
     pub ts: u64,
+    #[serde(default)]
+    pub agent_id: String,
     pub agent: String,
     pub event: String,
     pub message: String,
@@ -117,6 +154,7 @@ pub struct Store {
     pub agents: BTreeMap<String, Agent>,
     pub detected: Vec<Detected>,
     pub history: VecDeque<Entry>,
+    pub approvals: Vec<Approval>,
     history_file: Option<PathBuf>,
 }
 
@@ -164,9 +202,17 @@ impl Store {
         s
     }
 
-    pub fn record(&mut self, agent: &str, event: &str, message: &str) {
+    pub fn record(&mut self, agent_id: &str, agent: &str, event: &str, message: &str) {
+        if self
+            .history
+            .back()
+            .is_some_and(|l| l.agent_id == agent_id && l.event == event && l.message == message)
+        {
+            return; // identical consecutive entry
+        }
         let e = Entry {
             ts: now_secs(),
+            agent_id: agent_id.into(),
             agent: agent.into(),
             event: event.into(),
             message: message.into(),
@@ -185,8 +231,38 @@ impl Store {
         }
     }
 
-    /// Apply one event. Err = unknown event type. Ok(Some) = user should be notified.
+    fn pending_for(&self, agent_id: &str) -> bool {
+        self.approvals
+            .iter()
+            .any(|x| x.agent_id == agent_id && x.pending())
+    }
+
+    /// Apply one event. Err = invalid event. Ok(Some) = user should be notified.
     pub fn apply(&mut self, e: Event) -> Result<Option<Notice>, &'static str> {
+        const KINDS: [&str; 7] = [
+            "agent.started",
+            "agent.progress",
+            "agent.waiting",
+            "approval.required",
+            "agent.completed",
+            "agent.failed",
+            "agent.heartbeat",
+        ];
+        if !KINDS.contains(&e.event.as_str()) {
+            return Err("unknown event type");
+        }
+        let approval_id = e.approval_id.clone().unwrap_or_else(|| e.agent_id.clone());
+        if e.event == "approval.required" {
+            if self
+                .approvals
+                .iter()
+                .any(|x| x.id == approval_id && x.pending())
+            {
+                return Ok(None); // retry/duplicate of a request that is still open
+            }
+            self.approvals.retain(|x| x.id != approval_id);
+        }
+        let pending = self.pending_for(&e.agent_id);
         let a = self
             .agents
             .entry(e.agent_id.clone())
@@ -198,9 +274,8 @@ impl Store {
             "approval.required" => Status::Approval,
             "agent.completed" => Status::Done,
             "agent.failed" => Status::Failed,
-            "agent.heartbeat" if old == Status::Lost => Status::Running,
-            "agent.heartbeat" => old,
-            _ => return Err("unknown event type"),
+            _ if old == Status::Lost => Status::Running, // heartbeat after silence
+            _ => old,
         };
         a.seen = Instant::now();
         a.name = e.name.unwrap_or_else(|| a.name.clone());
@@ -216,31 +291,59 @@ impl Store {
         if new == Status::Done {
             a.progress = 100;
         }
-        if new == Status::Approval {
-            a.approval = None;
-        }
-        // A paused agent stays paused until the user resumes it, whatever it reports.
-        a.status = if old == Status::Paused && new == Status::Running {
-            old
-        } else {
-            new
+        // Paused sticks until the user resumes; an open approval sticks until answered.
+        a.status = match (old, new) {
+            (Status::Paused, Status::Running) => old,
+            (_, Status::Running) if pending => Status::Approval,
+            _ => new,
         };
         let (name, msg, task) = (a.name.clone(), a.message.clone(), a.task.clone());
-        let notify = new != old && matches!(new, Status::Approval | Status::Done | Status::Failed);
-        if e.event != "agent.heartbeat" && e.event != "agent.progress" {
-            self.record(&name, &e.event, if msg.is_empty() { &task } else { &msg });
+        let detail = e.detail.unwrap_or_default();
+        if new == Status::Approval {
+            self.approvals.push(Approval {
+                id: approval_id,
+                agent_id: e.agent_id.clone(),
+                agent: name.clone(),
+                message: msg.clone(),
+                detail: detail.clone(),
+                created: Instant::now(),
+                ttl: Duration::from_secs(
+                    e.expires_in.unwrap_or(APPROVAL_TTL).clamp(5, 86_400) as u64
+                ),
+                answer: None,
+                expired: false,
+            });
+            if let Some(a) = self.agents.get_mut(&e.agent_id) {
+                a.approval = None;
+            }
         }
+        if e.event != "agent.heartbeat" {
+            let text = match e.event.as_str() {
+                "approval.required" if !detail.is_empty() => detail.clone(),
+                "agent.progress" | "agent.started" if !task.is_empty() => task.clone(),
+                _ if !msg.is_empty() => msg.clone(),
+                _ => task.clone(),
+            };
+            self.record(&e.agent_id, &name, &e.event, &text);
+        }
+        let notify = (new != old
+            && matches!(new, Status::Approval | Status::Done | Status::Failed))
+            || e.notify == Some(true);
         Ok(notify.then(|| {
             let what = match new {
                 Status::Approval => "needs your approval",
                 Status::Done => "finished",
+                Status::Waiting => "needs attention",
                 _ => "failed",
             };
-            (format!("{name} {what}"), msg)
+            (
+                format!("{name} {what}"),
+                if detail.is_empty() { msg } else { detail },
+            )
         }))
     }
 
-    /// Mark silent API agents as lost (ttl * scale); returns notices for the newly lost.
+    /// Lost-heartbeat detection (ttl * scale) and approval expiry. Returns notices for newly lost agents.
     pub fn sweep(&mut self, scale: f32) -> Vec<Notice> {
         let mut lost = vec![];
         for a in self.agents.values_mut() {
@@ -249,36 +352,82 @@ impl Store {
                 && a.seen.elapsed() > a.ttl.mul_f32(scale)
             {
                 a.status = Status::Lost;
-                lost.push(a.name.clone());
+                lost.push((a.name.clone(), a.name.clone()));
             }
         }
+        let expired: Vec<(String, String, String)> = self
+            .approvals
+            .iter_mut()
+            .filter(|x| x.pending() && x.created.elapsed() > x.ttl.mul_f32(scale))
+            .map(|x| {
+                x.expired = true;
+                (x.agent_id.clone(), x.agent.clone(), x.detail.clone())
+            })
+            .collect();
+        for (id, name, detail) in expired {
+            self.settle(&id);
+            self.record(&id, &name, "approval.expired", &detail);
+        }
         lost.into_iter()
-            .map(|n| {
-                self.record(&n, "agent.heartbeat_lost", "no heartbeat");
+            .map(|(n, _)| {
+                self.record(&n, &n, "agent.heartbeat_lost", "no heartbeat");
                 (format!("{n} stopped responding"), "heartbeat lost".into())
             })
             .collect()
     }
 
-    pub fn answer(&mut self, id: &str, ok: bool) {
-        let Some(a) = self.agents.get_mut(id) else {
+    /// After an approval resolves: an agent with nothing else pending goes back to running.
+    fn settle(&mut self, agent_id: &str) {
+        let pending = self.pending_for(agent_id);
+        if let Some(a) = self.agents.get_mut(agent_id) {
+            a.seen = Instant::now(); // it was blocked on the user, not silent
+            if a.status == Status::Approval && !pending {
+                a.status = Status::Running;
+            }
+        }
+        // keep every pending approval plus the 100 most recent resolved ones
+        let resolved = self.approvals.iter().filter(|x| !x.pending()).count();
+        if resolved > 100 {
+            let mut skip = resolved - 100;
+            self.approvals.retain(|x| {
+                x.pending() || {
+                    let keep = skip == 0;
+                    skip = skip.saturating_sub(1);
+                    keep
+                }
+            });
+        }
+    }
+
+    /// Record the user's decision for one approval request.
+    pub fn answer(&mut self, approval_id: &str, ok: bool) {
+        let Some(ap) = self
+            .approvals
+            .iter_mut()
+            .find(|x| x.id == approval_id && x.pending())
+        else {
             return;
         };
-        a.approval = Some(ok);
-        a.status = if ok { Status::Running } else { Status::Failed };
-        let (name, msg) = (a.name.clone(), if ok { "approved" } else { "denied" });
-        if !ok {
-            a.message = "approval denied".into();
+        ap.answer = Some(ok);
+        let (id, name, detail) = (ap.agent_id.clone(), ap.agent.clone(), ap.detail.clone());
+        if let Some(a) = self.agents.get_mut(&id) {
+            a.approval = Some(ok);
         }
+        self.settle(&id);
         self.record(
+            &id,
             &name,
             if ok {
                 "approval.granted"
             } else {
                 "approval.denied"
             },
-            msg,
+            &detail,
         );
+    }
+
+    pub fn pending_approvals(&self) -> impl Iterator<Item = &Approval> {
+        self.approvals.iter().filter(|x| x.pending())
     }
 
     pub fn push_log(&mut self, id: &str, line: String) {
@@ -315,24 +464,71 @@ mod tests {
             progress: None,
             pid: None,
             ttl: None,
+            approval_id: None,
+            detail: None,
+            expires_in: None,
+            notify: None,
         }
+    }
+
+    fn ask(id: &str, aid: &str, detail: &str) -> Event {
+        let mut e = ev("approval.required", id);
+        e.approval_id = Some(aid.into());
+        e.detail = Some(detail.into());
+        e
     }
 
     #[test]
     fn lifecycle() {
         let mut s = Store::default();
         assert!(s.apply(ev("agent.started", "a")).unwrap().is_none()); // no noise on start
-        assert!(s.apply(ev("approval.required", "a")).unwrap().is_some());
-        assert!(s.apply(ev("approval.required", "a")).unwrap().is_none()); // no repeat spam
-        s.answer("a", true);
+        assert!(s.apply(ask("a", "r1", "rm -rf build")).unwrap().is_some());
+        assert!(s.apply(ask("a", "r1", "rm -rf build")).unwrap().is_none()); // retry of open request: no spam, no duplicate
+        assert_eq!(s.approvals.len(), 1);
+        assert_eq!(s.agents["a"].status, Status::Approval);
+        s.answer("r1", true);
         assert_eq!(
             (s.agents["a"].status, s.agents["a"].approval),
             (Status::Running, Some(true))
         );
+        s.answer("r1", false); // an answered approval can't be flipped or replayed
+        assert_eq!(s.approvals[0].status(), "approved");
         assert!(s.apply(ev("agent.completed", "a")).unwrap().is_some());
         assert_eq!(s.agents["a"].progress, 100);
         assert!(s.apply(ev("bogus", "a")).is_err());
-        assert!(s.history.len() >= 4); // started, approval x2, granted, completed all logged
+    }
+
+    #[test]
+    fn approvals_are_independent_and_never_auto_approved() {
+        let mut s = Store::default();
+        s.apply(ask("a", "r1", "git push")).unwrap();
+        s.apply(ask("a", "r2", "rm -rf /tmp/x")).unwrap();
+        s.apply(ev("agent.progress", "a")).unwrap(); // progress must not hide an open approval
+        assert_eq!(s.agents["a"].status, Status::Approval);
+        s.answer("r1", false);
+        assert_eq!(s.agents["a"].status, Status::Approval); // r2 still open
+        assert_eq!(s.approvals[0].status(), "denied");
+        assert_eq!(s.approvals[1].status(), "pending");
+        s.sweep(0.0); // expire everything
+        assert_eq!(s.approvals[1].status(), "expired"); // timeout means expired, never approved
+        assert_eq!(s.agents["a"].status, Status::Running); // waiting on the user must not read as "lost"
+        assert!(s.agents["a"].seen.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn history_is_per_agent() {
+        let mut s = Store::default();
+        let mut e = ev("agent.progress", "a");
+        e.task = Some("Bash cargo test".into());
+        s.apply(e).unwrap();
+        s.apply(ev("agent.started", "b")).unwrap();
+        assert_eq!(
+            s.history
+                .iter()
+                .filter(|h| h.agent_id == "a" && h.message == "Bash cargo test")
+                .count(),
+            1
+        );
     }
 
     #[test]

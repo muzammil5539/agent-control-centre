@@ -8,23 +8,48 @@ Runs on **Linux** and **Windows**.
 
 ![walkthrough](docs/demo.gif)
 
-| Needs approval | Managed agent, paused | Activity history |
+| Approval with the exact action | Per-agent history | Activity feed |
 |---|---|---|
-| ![](docs/screenshot.png) | ![](docs/paused.png) | ![](docs/activity.png) |
+| ![](docs/approval.png) | ![](docs/history.png) | ![](docs/activity.png) |
 
 ## What it does
 
-- **Live agent board**: status, task, progress, heartbeat age. Items needing you float to the top.
-- **Approve / Deny** agent requests. The agent polls the API for your answer.
+- **A harness over your coding agents.** Agents ask the HUD for permission and wait for *your* answer:
+  the HUD shows the **exact command/file** and Approve / Deny, with an expiry countdown. Answers are
+  bound to that one request (can't be replayed or flipped) and **an unanswered request expires, it is never
+  auto-approved**. See [Answering your coding agent's prompts](#answering-your-coding-agents-prompts).
+- **Activity history for every agent**, persisted across restarts: each agent card has an expandable
+  History (tool calls, approvals asked / granted / denied / expired), plus a filterable Activity feed.
+- **Live agent board**: status, task, progress, heartbeat age. Anything needing you floats to the top.
 - **Native notifications** for approval-needed, finished, failed and lost agents.
 - **Launch agents** from the *Launch* tab (any shell command). Output streams into the card;
-  the child can report progress via `acc emit ... $ACC_AGENT_ID`.
+  the child can report progress via `acc emit ... $ACC_AGENT_ID` or gate actions with `acc ask`.
 - **Pause / Resume / Stop** managed agents and reporting agents that supply a `pid` (Linux: real
   SIGSTOP/SIGCONT on the whole process group; Windows: Stop only).
 - **Auto-detect** agent CLIs already running (Claude Code, Codex, Gemini CLI, Aider, OpenCode, Goose,
   Cursor Agent, LangGraph, CrewAI) with CPU/memory, and control them too. Best-effort name matching.
-- **Persistent activity log** (`history.jsonl` in your data dir) survives restarts.
-- **Claude Code integration** through hooks, see below.
+
+## Answering your coding agent's prompts
+
+The HUD can answer a prompt only when the agent hands the decision to it. Two real integrations:
+
+**1. Claude Code (hooks).** Merge `integrations/claude-code-hooks.json` into `~/.claude/settings.json`
+(needs `acc` on `PATH`). `PreToolUse` runs `acc hook --gate mutating`: for `Bash`, `Write`, `Edit`,
+`MultiEdit` and `NotebookEdit` calls the hook blocks, the HUD pops the approval, and your click is
+returned to Claude Code as `allow` / `deny`. If you don't answer in time the hook returns nothing and
+Claude Code shows its own normal prompt. Gate modes: `--gate off|bash|mutating|all`.
+Use `integrations/claude-code-hooks-observe-only.json` to just watch. Every session, prompt and tool
+call lands in the agent's history either way.
+
+**2. Anything else (`acc ask`).** Wrap any risky step in your own agent or script:
+
+```sh
+acc ask my-agent --name "Deploy bot" --detail "kubectl delete ns staging" --timeout 120 && kubectl delete ns staging
+# exit 0 = approved, 1 = denied, 2 = unanswered/expired/HUD not running (treat as NO)
+```
+
+Limits: popups that an IDE or agent draws itself (VS Code, Cursor, Codex, ...) cannot be answered from
+outside unless that tool exposes a hook or API for it. The HUD never clicks other apps' windows.
 
 ## Install
 
@@ -34,14 +59,6 @@ Grab the archive for your OS from [Releases](../../releases) and run `agent-cont
 ```sh
 cargo build --release     # binaries in target/release: agent-control-centre, acc
 ```
-
-## Claude Code integration
-
-Merge `integrations/claude-code-hooks.json` into `~/.claude/settings.json` (needs `acc` on `PATH`).
-Every Claude Code session then shows up in the HUD: prompts as tasks, tool calls as live activity,
-permission prompts as **Approve/Deny** cards with a notification, and `Stop` as finished.
-Hooks fail silently when the HUD isn't running, so they never block Claude.
-(Approve/Deny in the HUD is a visual signal; Claude Code's own prompt still needs answering.)
 
 ## Event API (`127.0.0.1:7777`, local only)
 
@@ -55,20 +72,23 @@ curl -X POST localhost:7777/event -d '{"event":"agent.progress","agent_id":"my-a
 |---|---|
 | `agent.started` / `agent.progress` | running, updates task/progress/message |
 | `agent.waiting` | waiting |
-| `approval.required` | Approve / Deny card + notification |
+| `approval.required` | Approval card + notification; use `approval_id` + `detail`, poll `GET /approvals/<id>` |
 | `agent.completed` / `agent.failed` | done / failed + notification |
 | `agent.heartbeat` | refresh liveness (every event does) |
 
 Optional fields: `name`, `task`, `message`, `progress` (0-100), `pid` (enables Pause/Stop),
-`ttl` (seconds of silence before the agent is flagged **lost**, default 30).
-Read back: `GET /agents`, `GET /agents/<id>` → `{"status": "...", "approval": null|true|false}`.
+`ttl` (seconds of silence before the agent is flagged **lost**, default 30), `notify` (force a notification),
+and for approvals `approval_id` (unique per request), `detail` (the exact action) and `expires_in` (seconds, default 300).
+Read back: `GET /agents`, `GET /agents/<id>`, `GET /approvals` (pending) and
+`GET /approvals/<id>` → `{"status": "pending|approved|denied|expired"}`. Only the HUD user can resolve an approval.
 
 ## Notes and limits
 
 - Anything on localhost can post events, so the port is bound to `127.0.0.1` only; don't expose it.
   The API reports state; it never starts processes. Only you can, from the Launch tab.
 - Detection is name-based and can miss or mislabel unusual setups.
-- Not yet: tray icon, token/cost tracking, remote machines.
+- Not yet: system tray, global hotkey, token/cost tracking, remote machines. Full list: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+- The local API has no auth token yet: another local process could post a fake approval *request* (it still can't answer one).
 - The Windows build is cross-compiled; it has had less hands-on testing than Linux.
 
 Design system: dark slate + green accent, Fira Sans / Fira Code (SIL OFL), chosen with the ui-ux-pro-max skill.
