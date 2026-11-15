@@ -1,6 +1,6 @@
 //! Local API token. The HUD creates it once; `acc` reads it from the data directory.
 //! It stops other local users and web pages (which can POST to 127.0.0.1) from talking to the API.
-use crate::store::data_dir;
+use crate::config::data_dir;
 use std::{io::Write, path::PathBuf};
 
 pub fn token_path() -> Option<PathBuf> {

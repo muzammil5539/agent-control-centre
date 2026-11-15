@@ -1,10 +1,11 @@
 //! Desktop integration: system tray, global show/hide hotkey, minimise-to-tray.
 //! Linux uses the StatusNotifierItem D-Bus protocol (`ksni`, no GTK needed); Windows uses `tray-icon`.
-use agent_control_centre::store::Store;
+use acc_core::store::Store;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
-pub const DEFAULT_HOTKEY: &str = "ctrl+alt+KeyA";
+#[cfg(test)]
+use acc_core::config::DEFAULT_HOTKEY;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Cmd {
@@ -66,16 +67,18 @@ pub struct Shell {
     _tray: Option<tray_icon::TrayIcon>,
 }
 
-fn register_hotkey(tx: Sender<Cmd>) -> (Result<String, String>, Option<GlobalHotKeyManager>) {
-    let spec = std::env::var("ACC_HOTKEY").unwrap_or_else(|_| DEFAULT_HOTKEY.into());
+fn register_hotkey(
+    tx: Sender<Cmd>,
+    spec: &str,
+) -> (Result<String, String>, Option<GlobalHotKeyManager>) {
     let res = (|| {
         let hk: HotKey = spec
             .parse()
-            .map_err(|e| format!("bad ACC_HOTKEY '{spec}': {e}"))?;
+            .map_err(|e| format!("bad hotkey '{spec}': {e}"))?;
         let mgr = GlobalHotKeyManager::new()
             .map_err(|e| format!("global hotkeys unavailable here ({e}); X11/Windows only"))?;
         mgr.register(hk)
-            .map_err(|e| format!("{} is taken or not allowed ({e})", hotkey_label(&spec)))?;
+            .map_err(|e| format!("{} is taken or not allowed ({e})", hotkey_label(spec)))?;
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.id == hk.id() && e.state == HotKeyState::Pressed {
                 let _ = tx.send(Cmd::Toggle);
@@ -84,14 +87,14 @@ fn register_hotkey(tx: Sender<Cmd>) -> (Result<String, String>, Option<GlobalHot
         Ok(mgr)
     })();
     match res {
-        Ok(m) => (Ok(hotkey_label(&spec)), Some(m)),
+        Ok(m) => (Ok(hotkey_label(spec)), Some(m)),
         Err(e) => (Err(e), None),
     }
 }
 
 /// Must be called on the main (event-loop) thread, after the window exists.
-pub fn start(tx: Sender<Cmd>, store: Arc<Mutex<Store>>) -> Shell {
-    let (hotkey, _hk) = register_hotkey(tx.clone());
+pub fn start(tx: Sender<Cmd>, store: Arc<Mutex<Store>>, hotkey: &str) -> Shell {
+    let (hotkey, _hk) = register_hotkey(tx.clone(), hotkey);
     #[cfg(target_os = "linux")]
     {
         let tray = linux::spawn(tx, store);
@@ -123,6 +126,72 @@ pub fn start(tx: Sender<Cmd>, store: Arc<Mutex<Store>>) -> Shell {
             hotkey,
             _hk,
         }
+    }
+}
+
+/// Start the HUD at login. Linux: an XDG autostart entry. Windows: the per-user Run key.
+pub fn autostart_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("reg")
+            .args(["query", RUN_KEY, "/v", "AgentControlCentre"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        autostart_file().is_some_and(|f| f.exists())
+    }
+}
+
+#[cfg(windows)]
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+#[cfg(not(windows))]
+fn autostart_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config")))?;
+    Some(base.join("autostart/agent-control-centre.desktop"))
+}
+
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        let mut c = std::process::Command::new("reg");
+        if on {
+            c.args([
+                "add",
+                RUN_KEY,
+                "/v",
+                "AgentControlCentre",
+                "/d",
+                &format!("\"{}\"", exe.display()),
+                "/f",
+            ]);
+        } else {
+            c.args(["delete", RUN_KEY, "/v", "AgentControlCentre", "/f"]);
+        }
+        c.output().map_err(|e| e.to_string()).and_then(|o| {
+            o.status
+                .success()
+                .then_some(())
+                .ok_or_else(|| "reg failed".to_string())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let f = autostart_file().ok_or("no config directory")?;
+        if !on {
+            return match std::fs::remove_file(&f) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            };
+        }
+        std::fs::create_dir_all(f.parent().unwrap_or(&f)).map_err(|e| e.to_string())?;
+        std::fs::write(&f, format!("[Desktop Entry]\nType=Application\nName=Agent Control Centre\nComment=Monitor and approve AI agents\nExec=\"{}\"\nIcon=agent-control-centre\nX-GNOME-Autostart-enabled=true\n", exe.display()))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -279,6 +348,25 @@ mod tests {
         assert_eq!(hotkey_label(DEFAULT_HOTKEY), "Ctrl+Alt+A");
         assert!("ctrl+shift+Space".parse::<HotKey>().is_ok());
         assert!("not a key".parse::<HotKey>().is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn autostart_entry_is_written_and_removed() {
+        let dir = std::env::temp_dir().join(format!("acc-autostart-{}", std::process::id()));
+        // SAFETY: tests in this binary do not read XDG_CONFIG_HOME concurrently.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        assert!(!autostart_enabled());
+        set_autostart(true).unwrap();
+        let text =
+            std::fs::read_to_string(dir.join("autostart/agent-control-centre.desktop")).unwrap();
+        assert!(
+            autostart_enabled() && text.contains("Exec=\"") && text.contains("Type=Application")
+        );
+        set_autostart(false).unwrap();
+        set_autostart(false).unwrap(); // removing twice is fine
+        assert!(!autostart_enabled());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

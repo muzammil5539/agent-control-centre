@@ -1,0 +1,17 @@
+[package]
+name = "acc-core"
+version = "0.3.0"
+edition = "2024"
+description = "Agent Control Centre core: protocol, store, local API, client SDK and the acc CLI (no GUI dependencies)"
+license = "MIT"
+
+[[bin]]
+name = "acc"
+path = "src/bin/acc.rs"
+
+[dependencies]
+getrandom = "0.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sysinfo = "0.40.3"
+tiny_http = "0.12.0"
