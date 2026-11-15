@@ -1,10 +1,74 @@
 {
   "hooks": {
-    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "acc hook" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "acc hook" }] }],
-    "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "acc hook" }] }],
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "acc hook" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "acc hook" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "acc hook" }] }]
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "acc hook"
+          }
+        ]
+      }
+    ]
   }
 }

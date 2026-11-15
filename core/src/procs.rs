@@ -147,7 +147,7 @@ impl Procs {
             spec.name.trim()
         };
         let mut a = Agent::new(name, Source::Managed);
-        a.task = cmd.into();
+        a.task = crate::store::redact(cmd); // shown on the card and returned by the API
         a.pid = Some(child.id());
         a.workspace = dir.into();
         {

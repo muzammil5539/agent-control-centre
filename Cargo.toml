@@ -1,5 +1,6 @@
 [workspace]
-members = ["core"]
+members = [".", "core"]
+default-members = [".", "core"] # plain `cargo build` builds the HUD and the acc CLI
 
 [package]
 name = "agent-control-centre"
@@ -19,6 +20,9 @@ tiny_http = "0.12.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2" # SIGTERM / SIGINT: stop managed agents and save before exiting
 
 [target."cfg(windows)".dependencies]
 tray-icon = "0.26.1"

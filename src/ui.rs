@@ -175,6 +175,21 @@ fn empty(ui: &mut egui::Ui, title: &str, hint: &str) {
     });
 }
 
+/// Card title: the pills keep their place on the right and a long name is cut short instead of running under them.
+fn title_row(ui: &mut egui::Ui, name: &str, tag: &str, pills: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            pills(ui);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(name).font(theme::semibold(14.5))).truncate(),
+                );
+                ui.label(RichText::new(tag).size(10.5).color(DIM));
+            });
+        });
+    });
+}
+
 enum Act {
     Answer(String, bool),
     Choose(String, String),
@@ -498,18 +513,15 @@ impl App {
             status_color(a.status)
         };
         card(ui, col, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&a.name).font(theme::semibold(14.5)));
-                ui.label(
-                    RichText::new(if a.source == Source::Managed {
-                        "managed"
-                    } else {
-                        "api"
-                    })
-                    .size(10.5)
-                    .color(DIM),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            title_row(
+                ui,
+                &a.name,
+                if a.source == Source::Managed {
+                    "managed"
+                } else {
+                    "api"
+                },
+                |ui| {
                     // Two separate facts: what it was doing, and whether we still hear from it.
                     match a.conn {
                         Conn::Lost => pill(ui, "lost contact", VIOLET),
@@ -521,8 +533,8 @@ impl App {
                         Some(_) => pill(ui, "resuming…", ACCENT),
                         None => pill(ui, a.status.label(), status_color(a.status)),
                     }
-                });
-            });
+                },
+            );
             if !a.task.is_empty() {
                 ui.label(RichText::new(&a.task).color(DIM));
             }
@@ -640,10 +652,15 @@ impl App {
             ORANGE
         };
         card(ui, col, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&ap.agent).font(theme::semibold(14.5)));
-                dim(ui, "is asking");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            title_row(
+                ui,
+                &ap.agent,
+                if ap.options.is_empty() {
+                    "asks to run"
+                } else {
+                    "asks"
+                },
+                |ui| {
                     pill(
                         ui,
                         &format!("expires {}", remaining(ap.remaining().as_secs())),
@@ -652,8 +669,8 @@ impl App {
                     if ap.options.is_empty() {
                         pill(ui, ap.risk.label(), risk_color(ap.risk));
                     }
-                });
-            });
+                },
+            );
             if !ap.message.is_empty() {
                 dim(ui, &ap.message);
             }
@@ -1623,6 +1640,11 @@ impl eframe::App for App {
         let o = self.store.lock().unwrap().cfg.opacity;
         let [r, g, b, _] = theme::BG.to_normalized_gamma_f32();
         [r * o, g * o, b * o, o] // premultiplied
+    }
+
+    /// Window size and position are written soon after they change, so they survive a kill or a logout.
+    fn auto_save_interval(&self) -> Duration {
+        Duration::from_secs(5)
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

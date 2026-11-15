@@ -11,7 +11,7 @@ mod theme;
 mod ui;
 
 use acc_core::procs::{self, Procs, Wake};
-use acc_core::store::{Notice, Severity, Store};
+use acc_core::store::{Notice, Store};
 use acc_core::{api, auth, log};
 use eframe::egui;
 use serde_json::json;
@@ -27,11 +27,14 @@ fn os_notify(n: Notice) {
         .summary(&n.title)
         .body(&n.body);
     #[cfg(all(unix, not(target_os = "macos")))]
-    note.urgency(match n.severity {
-        Severity::Info => notify_rust::Urgency::Low,
-        Severity::Warning => notify_rust::Urgency::Normal,
-        Severity::Critical => notify_rust::Urgency::Critical,
-    });
+    {
+        use acc_core::store::Severity;
+        note.urgency(match n.severity {
+            Severity::Info => notify_rust::Urgency::Low,
+            Severity::Warning => notify_rust::Urgency::Normal,
+            Severity::Critical => notify_rust::Urgency::Critical,
+        });
+    }
     // Errors ignored: a missing notification daemon must never break monitoring.
     let _ = note.show();
 }
@@ -53,6 +56,24 @@ pub fn shutdown(store: &Mutex<Store>, procs: &Mutex<Procs>) {
     log::info("shutdown", json!({}));
 }
 
+/// Set by SIGTERM / SIGINT (logout, `kill`, Ctrl+C). The ticker sees it and shuts down cleanly.
+static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn catch_signals() {
+    extern "C" fn on_signal(_: libc::c_int) {
+        TERMINATE.store(true, Ordering::SeqCst); // the only thing that is safe to do here
+    }
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+#[cfg(not(unix))]
+fn catch_signals() {}
+
 pub fn level(pinned: bool) -> egui::WindowLevel {
     if pinned {
         egui::WindowLevel::AlwaysOnTop
@@ -70,6 +91,7 @@ fn main() -> eframe::Result {
         std::process::exit(1);
     });
     let token = auth::load_or_create();
+    catch_signals();
     log::info(
         "started",
         json!({"version": env!("CARGO_PKG_VERSION"), "addr": cfg.addr}),
@@ -112,7 +134,8 @@ fn main() -> eframe::Result {
                 let (ctx, visible) = (ctx.clone(), visible.clone());
                 move || {
                     if visible.load(Ordering::SeqCst) {
-                        ctx.request_repaint();
+                        // At most ~10 repaints a second however fast events arrive.
+                        ctx.request_repaint_after(Duration::from_millis(100));
                     }
                 }
             });
@@ -133,6 +156,10 @@ fn main() -> eframe::Result {
             std::thread::spawn({
                 let (s, procs, wake) = (s.clone(), procs.clone(), wake.clone());
                 move || loop {
+                    if TERMINATE.load(Ordering::SeqCst) {
+                        shutdown(&s, &procs);
+                        std::process::exit(0);
+                    }
                     let exited = {
                         let mut p = procs.lock().unwrap();
                         let exited = {

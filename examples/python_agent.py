@@ -5,10 +5,13 @@ Run the HUD first, then:  python3 examples/python_agent.py
 """
 import json, os, sys, time, urllib.error, urllib.request, uuid
 
-BASE = "http://127.0.0.1:7777/api/v1"
+BASE = f"http://{os.environ.get('ACC_ADDR', '127.0.0.1:7777')}/api/v1"
 
 
 def token() -> str:
+    if os.environ.get("ACC_DATA_DIR"):
+        with open(os.path.join(os.environ["ACC_DATA_DIR"], "token")) as f:
+            return f.read().strip()
     root = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
     if os.name == "nt":
         root = os.environ["APPDATA"]

@@ -1,0 +1,8 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Name=Agent Control Centre
+Comment=Monitor, approve and control AI agents
+Exec=agent-control-centre
+Terminal=false
+Categories=Development;Utility;
