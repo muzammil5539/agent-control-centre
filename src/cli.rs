@@ -12,7 +12,9 @@ fn request(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
     let addr = ADDR.to_socket_addrs().ok()?.next()?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    write!(s, "{method} {path} HTTP/1.1\r\nHost: {ADDR}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).ok()?;
+    let auth =
+        crate::auth::read().map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+    write!(s, "{method} /api/v1{path} HTTP/1.1\r\nHost: {ADDR}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).ok()?;
     let mut out = String::new();
     s.read_to_string(&mut out).ok()?;
     let code = out.split_whitespace().nth(1)?.parse().ok()?;
@@ -231,10 +233,19 @@ pub fn main() {
                     val.clone().into()
                 };
             }
-            post(&e);
+            if !post(&e) {
+                eprintln!(
+                    "not delivered: is the HUD running? (`acc token` shows the token file it uses)"
+                );
+                std::process::exit(1);
+            }
         }
+        Some("token") => match crate::auth::token_path() {
+            Some(p) => println!("{}", p.display()), // send as `Authorization: Bearer <file contents>`
+            None => std::process::exit(1),
+        },
         _ => eprintln!(
-            "usage: acc emit <event> <agent_id> [--name N] [--task T] [--message M] [--progress P] [--pid PID] [--ttl S]\n       acc ask <agent_id> --detail TEXT [--name N] [--timeout S]   (exit 0 approved / 1 denied / 2 unanswered)\n       acc hook [--gate off|bash|mutating|all] [--timeout S]   (reads a Claude Code hook payload on stdin)"
+            "usage: acc emit <event> <agent_id> [--name N] [--task T] [--message M] [--progress P] [--pid PID] [--ttl S]\n       acc ask <agent_id> --detail TEXT [--name N] [--timeout S]   (exit 0 approved / 1 denied / 2 unanswered)\n       acc hook [--gate off|bash|mutating|all] [--timeout S]   (reads a Claude Code hook payload on stdin)\n       acc token   (print the path of the API token file)"
         ),
     }
 }

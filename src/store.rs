@@ -10,6 +10,8 @@ use std::{
 pub const ADDR: &str = "127.0.0.1:7777"; // localhost only
 pub const DEFAULT_TTL: u32 = 30; // seconds of silence before an API agent is "lost"
 const HISTORY_CAP: usize = 2000;
+pub const PROTOCOL_VERSION: u32 = 1;
+const SEEN_CAP: usize = 1024; // remembered event ids
 pub const APPROVAL_TTL: u32 = 300; // seconds a pending approval stays open
 const LOG_CAP: usize = 40;
 
@@ -107,6 +109,8 @@ pub struct Event {
     pub detail: Option<String>,      // the exact action awaiting approval (shown in full)
     pub expires_in: Option<u32>,     // approval lifetime in seconds
     pub notify: Option<bool>,        // force a native notification for this event
+    pub protocol_version: Option<u32>, // envelope: only 1 is understood
+    pub event_id: Option<String>,    // envelope: a repeated id is ignored (safe retries)
 }
 
 /// A request for the user's permission. Bound to one exact action; never auto-approved.
@@ -155,6 +159,7 @@ pub struct Store {
     pub detected: Vec<Detected>,
     pub history: VecDeque<Entry>,
     pub approvals: Vec<Approval>,
+    seen_ids: VecDeque<String>,
     history_file: Option<PathBuf>,
 }
 
@@ -166,7 +171,7 @@ pub fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn data_dir() -> Option<PathBuf> {
+pub fn data_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA")?.into()
     } else if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
@@ -215,7 +220,7 @@ impl Store {
             agent_id: agent_id.into(),
             agent: agent.into(),
             event: event.into(),
-            message: message.into(),
+            message: redact(message), // secrets never reach history or disk
         };
         if let Some(f) = &self.history_file
             && let Ok(mut f) = std::fs::OpenOptions::new()
@@ -250,6 +255,21 @@ impl Store {
         ];
         if !KINDS.contains(&e.event.as_str()) {
             return Err("unknown event type");
+        }
+        if e.protocol_version.is_some_and(|v| v != PROTOCOL_VERSION) {
+            return Err("unsupported protocol_version");
+        }
+        if let Some(id) = &e.event_id {
+            if id.len() > 128 {
+                return Err("event_id too long");
+            }
+            if self.seen_ids.contains(id) {
+                return Ok(None); // retry of an event we already applied
+            }
+            self.seen_ids.push_back(id.clone());
+            if self.seen_ids.len() > SEEN_CAP {
+                self.seen_ids.pop_front();
+            }
         }
         let approval_id = e.approval_id.clone().unwrap_or_else(|| e.agent_id.clone());
         if e.event == "approval.required" {
@@ -450,6 +470,81 @@ impl Store {
     }
 }
 
+const SECRET_KEYS: [&str; 10] = [
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_key",
+    "private_key",
+    "authorization",
+];
+const SECRET_PREFIXES: [&str; 9] = [
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "AIza",
+];
+
+fn sensitive_key(k: &str) -> bool {
+    let k = k.trim_start_matches('-').to_ascii_lowercase();
+    SECRET_KEYS.iter().any(|s| k.contains(s))
+}
+
+fn looks_secret(w: &str) -> bool {
+    (w.len() >= 16 && SECRET_PREFIXES.iter().any(|p| w.starts_with(p)))
+        || (w.len() >= 24 && w.starts_with("eyJ") && w.matches('.').count() == 2) // JWT
+}
+
+/// Best-effort removal of credentials from text before it is stored: `key=value` with a
+/// secret-looking key, `--token value`, `Bearer x`, well-known token formats and `user:pass@`
+/// in URLs. A heuristic, not a guarantee.
+pub fn redact(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut hide_next = false;
+    for tok in s.split_inclusive(char::is_whitespace) {
+        let word = tok.trim_end();
+        let tail = &tok[word.len()..];
+        let core = word.trim_matches(|c| "\"'`,;()[]{}".contains(c));
+        let mut w = word.to_string();
+        if core.is_empty() {
+            // nothing to inspect
+        } else if hide_next {
+            w = w.replace(core, "[redacted]");
+            hide_next = false;
+        } else if let Some((k, v)) = core.split_once(['=', ':'])
+            && !v.is_empty()
+            && !v.starts_with("//")
+            && (sensitive_key(k) || looks_secret(v))
+        {
+            w = w.replace(v, "[redacted]");
+        } else if looks_secret(core) {
+            w = w.replace(core, "[redacted]");
+        } else if let Some(i) = core.find("://")
+            && let Some(at) = core[i + 3..].find('@')
+            && !core[i + 3..i + 3 + at].contains('/')
+        {
+            let user = &core[i + 3..i + 3 + at];
+            w = w.replace(user, "[redacted]");
+        } else if core.eq_ignore_ascii_case("bearer")
+            || (core.starts_with('-') && sensitive_key(core) && !core.contains('='))
+        {
+            hide_next = true;
+        }
+        out.push_str(&w);
+        out.push_str(tail);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +563,8 @@ mod tests {
             detail: None,
             expires_in: None,
             notify: None,
+            protocol_version: None,
+            event_id: None,
         }
     }
 
@@ -552,5 +649,42 @@ mod tests {
         s.agents.get_mut("a").unwrap().status = Status::Paused;
         s.apply(ev("agent.progress", "a")).unwrap();
         assert_eq!(s.agents["a"].status, Status::Paused);
+    }
+
+    #[test]
+    fn envelope_version_and_dedup() {
+        let mut s = Store::default();
+        let mut e = ev("agent.started", "a");
+        e.protocol_version = Some(2);
+        assert!(s.apply(e).is_err()); // unknown version is refused
+        let mut e = ev("agent.progress", "a");
+        e.event_id = Some("e1".into());
+        e.message = Some("step 1".into());
+        e.protocol_version = Some(1);
+        s.apply(e).unwrap();
+        let mut again = ev("agent.progress", "a");
+        again.event_id = Some("e1".into());
+        again.message = Some("step 1 (retry, must be ignored)".into());
+        s.apply(again).unwrap();
+        assert_eq!(s.agents["a"].message, "step 1"); // second delivery not applied
+        let mut long = ev("agent.progress", "a");
+        long.event_id = Some("x".repeat(200));
+        assert!(s.apply(long).is_err());
+    }
+
+    #[test]
+    fn secrets_are_redacted_from_history_not_from_the_approval() {
+        let r = redact("curl -H 'Authorization: Bearer abcdef123456' https://u:pw@host/x");
+        assert!(!r.contains("abcdef123456") && !r.contains("u:pw"), "{r}");
+        assert!(redact("GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaa npm publish").contains("[redacted]"));
+        assert!(!redact("deploy --password hunter2 now").contains("hunter2"));
+        assert!(!redact("export KEY=sk-abcdefghijklmnopqrstu").contains("sk-abc"));
+        assert_eq!(redact("cargo build --release"), "cargo build --release"); // ordinary text untouched
+        assert_eq!(redact("echo author:bob"), "echo author:bob");
+        let mut s = Store::default();
+        s.apply(ask("a", "r1", "psql postgres://admin:s3cret@db/prod"))
+            .unwrap();
+        assert!(s.approvals[0].detail.contains("s3cret")); // user must see the exact action
+        assert!(!s.history.back().unwrap().message.contains("s3cret")); // but history is scrubbed
     }
 }

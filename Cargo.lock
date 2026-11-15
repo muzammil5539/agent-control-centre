@@ -139,6 +139,7 @@ name = "agent-control-centre"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "getrandom 0.3.4",
  "global-hotkey",
  "ksni",
  "notify-rust",

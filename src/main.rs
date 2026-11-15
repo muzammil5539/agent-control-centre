@@ -9,9 +9,11 @@
 mod shell;
 mod theme;
 
+use agent_control_centre::auth;
 use agent_control_centre::procs::{self, CAN_PAUSE, Procs, Sig};
 use agent_control_centre::store::{
-    ADDR, Agent, Approval, Detected, Entry, Event, Notice, Source, Status, Store, now_secs,
+    ADDR, Agent, Approval, Detected, Entry, Event, Notice, PROTOCOL_VERSION, Source, Status, Store,
+    now_secs,
 };
 use eframe::egui::{self, Color32, Margin, RichText, Stroke};
 use serde_json::json;
@@ -44,14 +46,29 @@ fn notify((title, body): Notice) {
         .show();
 }
 
-fn serve(server: tiny_http::Server, store: Arc<Mutex<Store>>, ctx: egui::Context) {
+fn serve(server: tiny_http::Server, store: Arc<Mutex<Store>>, ctx: egui::Context, token: String) {
     for mut req in server.incoming_requests() {
         let method = req.method().clone();
-        let path = req.url().to_string();
+        let url = req.url().to_string();
+        // /api/v1/x is the canonical route; the bare /x form is kept as an alias.
+        let path = url.strip_prefix("/api/v1").unwrap_or(&url).to_string();
+        let bearer = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.to_string());
         // Expire stale approvals/heartbeats on every request too, so answers stay correct while the window is hidden.
         let swept = store.lock().unwrap().sweep(1.0);
         swept.into_iter().for_each(notify);
         let (code, body) = match (method, path.as_str()) {
+            (tiny_http::Method::Get, "/health") => (
+                200,
+                json!({"ok": true, "version": env!("CARGO_PKG_VERSION"), "protocol_version": PROTOCOL_VERSION}),
+            ),
+            _ if !auth::check(bearer.as_deref(), &token) => (
+                401,
+                json!({"error": "missing or wrong token; see `acc token` for the file to read"}),
+            ),
             (tiny_http::Method::Post, "/event") => {
                 let mut buf = String::new();
                 // 64 KiB cap so a rogue local process can't make us buffer forever.
@@ -856,6 +873,7 @@ fn main() -> eframe::Result {
         eprintln!("cannot listen on {ADDR} (already running?): {e}");
         std::process::exit(1);
     });
+    let token = auth::load_or_create();
     let store = Arc::new(Mutex::new(Store::persistent()));
     let opts = eframe::NativeOptions {
         persist_window: true, // remembers size and position between runs
@@ -876,7 +894,7 @@ fn main() -> eframe::Result {
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn({
                 let (s, ctx) = (s.clone(), ctx.clone());
-                move || serve(server, s, ctx)
+                move || serve(server, s, ctx, token)
             });
             procs::watch(s.clone(), ctx.clone());
 

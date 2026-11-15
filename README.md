@@ -68,9 +68,12 @@ cargo build --release     # binaries in target/release: agent-control-centre, ac
 
 ```sh
 acc emit agent.started my-agent --name "My Agent" --task "Refactoring auth" --progress 10
-# or plain HTTP from any language:
-curl -X POST localhost:7777/event -d '{"event":"agent.progress","agent_id":"my-agent","progress":40,"pid":1234,"ttl":120}'
+# or plain HTTP from any language (the token is created by the HUD, see docs/protocol.md):
+curl -X POST localhost:7777/api/v1/event -H "Authorization: Bearer $(cat "$(acc token)")" \
+  -d '{"event":"agent.progress","agent_id":"my-agent","progress":40,"pid":1234,"ttl":120}'
 ```
+
+Full reference: [docs/protocol.md](docs/protocol.md). A Python adapter lives in [examples/python_agent.py](examples/python_agent.py).
 
 | `event` | Effect |
 |---|---|
@@ -83,12 +86,14 @@ curl -X POST localhost:7777/event -d '{"event":"agent.progress","agent_id":"my-a
 Optional fields: `name`, `task`, `message`, `progress` (0-100), `pid` (enables Pause/Stop),
 `ttl` (seconds of silence before the agent is flagged **lost**, default 30), `notify` (force a notification),
 and for approvals `approval_id` (unique per request), `detail` (the exact action) and `expires_in` (seconds, default 300).
+Optional envelope: `protocol_version` (must be 1) and `event_id` (a repeated id is ignored, so retries are safe).
 Read back: `GET /agents`, `GET /agents/<id>`, `GET /approvals` (pending) and
 `GET /approvals/<id>` → `{"status": "pending|approved|denied|expired"}`. Only the HUD user can resolve an approval.
 
 ## Notes and limits
 
-- Anything on localhost can post events, so the port is bound to `127.0.0.1` only; don't expose it.
+- The port is bound to `127.0.0.1` only, and every route except `/api/v1/health` needs the bearer token the HUD writes to
+  your data directory (owner-readable). Don't expose the port.
   The API reports state; it never starts processes. Only you can, from the Launch tab.
 - Tray: Linux needs a StatusNotifier host (KDE, Cinnamon, XFCE and others have one; GNOME needs the AppIndicator
   extension). If there is no tray, closing the window quits instead of hiding, and the Launch tab says so.
@@ -96,7 +101,8 @@ Read back: `GET /agents`, `GET /agents/<id>`, `GET /approvals` (pending) and
   Windows tray tooltip/icon do not change for pending approvals yet.
 - Detection is name-based and can miss or mislabel unusual setups.
 - Not yet: token/cost tracking, remote machines. Full list: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
-- The local API has no auth token yet: another local process could post a fake approval *request* (it still can't answer one).
+- Anything running as *you* can read the token, so it protects against other users and web pages, not against your own processes.
+- History is scrubbed of obvious credentials before it is stored (heuristic, not a guarantee).
 - The Windows build is cross-compiled; it has had less hands-on testing than Linux.
 
 Design system: dark slate + green accent, Fira Sans / Fira Code (SIL OFL), chosen with the ui-ux-pro-max skill.
