@@ -11,14 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: Linux deps (notifications/windowing are dlopen'd; nothing needed to build)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
       - run: cargo test --release
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-control-centre-${{ runner.os }}
+          name: agent-control-centre-${{ matrix.os }}
           path: |
             target/release/agent-control-centre
             target/release/agent-control-centre.exe
