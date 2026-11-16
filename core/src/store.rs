@@ -880,7 +880,9 @@ impl Store {
         if let Some(c) = e.capabilities {
             a.capabilities = c.into_iter().take(16).map(|c| clip(c, 40)).collect();
         }
-        a.pid = e.pid.or(a.pid);
+        if a.source == Source::Api {
+            a.pid = e.pid.or(a.pid); // a launched agent's pid is set by the HUD only: an event must not redirect its controls
+        }
         if let Some(t) = e.ttl {
             a.ttl_secs = t.clamp(5, 86_400);
         }
@@ -1579,6 +1581,27 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn an_event_cannot_redirect_a_launched_agents_pid() {
+        let mut s = Store::default();
+        let mut m = Agent::new("launched", Source::Managed);
+        m.pid = Some(4242);
+        s.agents.insert("managed-1".into(), m);
+        let hostile = |pid| Event {
+            pid: Some(pid),
+            ..ev("agent.progress", "managed-1")
+        };
+        s.apply(hostile(1)).unwrap();
+        assert_eq!(s.agents["managed-1"].pid, Some(4242)); // still the process the HUD started
+        s.agents.get_mut("managed-1").unwrap().pid = None; // it exited
+        s.apply(hostile(1)).unwrap();
+        assert_eq!(s.agents["managed-1"].pid, None); // and cannot be re-armed with another pid
+        let mut e = ev("agent.started", "mine");
+        e.pid = Some(77);
+        s.apply(e).unwrap();
+        assert_eq!(s.agents["mine"].pid, Some(77)); // an agent may still report its own
     }
 
     #[test]

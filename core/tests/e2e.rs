@@ -1,6 +1,7 @@
 //! End to end over real sockets and real processes: three independent agents (separate `acc`
 //! processes) talk to the API; one is approved, one denied, one goes silent and comes back;
 //! then the HUD "restarts" and history and agents are still there.
+#![cfg(unix)] // drives sh, sleep and signals
 use acc_core::store::{Conn, Status, Store};
 use acc_core::{api, auth};
 use std::{
