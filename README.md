@@ -8,9 +8,19 @@ Runs on **Linux** and **Windows**.
 
 ![walkthrough](docs/demo.gif)
 
-| Approval with the exact action | Per-agent history | Activity feed |
+| Approvals with risk level and questions | The agent board | Per-agent history |
 |---|---|---|
-| ![](docs/approval.png) | ![](docs/history.png) | ![](docs/activity.png) |
+| ![](docs/approval.png) | ![](docs/screenshot.png) | ![](docs/history.png) |
+
+| Activity feed with filters | Notification history | Workspaces and conflicts |
+|---|---|---|
+| ![](docs/activity.png) | ![](docs/alerts.png) | ![](docs/workspaces.png) |
+
+Compact mode, and an agent launched from the HUD with its output:
+
+![](docs/compact.png)
+
+![](docs/managed-agent.png)
 
 ## What it does
 

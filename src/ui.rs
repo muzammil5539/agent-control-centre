@@ -184,7 +184,8 @@ fn title_row(ui: &mut egui::Ui, name: &str, tag: &str, pills: impl FnOnce(&mut e
                 ui.add(
                     egui::Label::new(RichText::new(name).font(theme::semibold(14.5))).truncate(),
                 );
-                ui.label(RichText::new(tag).size(10.5).color(DIM));
+                // the tag gives way first when the row is tight
+                ui.add(egui::Label::new(RichText::new(tag).size(10.5).color(DIM)).truncate());
             });
         });
     });
